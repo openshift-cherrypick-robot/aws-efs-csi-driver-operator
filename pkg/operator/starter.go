@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
@@ -27,7 +28,10 @@ import (
 	operatorinformer "github.com/openshift/client-go/operator/informers/externalversions"
 	"github.com/openshift/library-go/pkg/controller/controllercmd"
 	"github.com/openshift/library-go/pkg/operator/csi/csicontrollerset"
+	dc "github.com/openshift/library-go/pkg/operator/deploymentcontroller"
 	goc "github.com/openshift/library-go/pkg/operator/genericoperatorclient"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 )
 
 const (
@@ -90,7 +94,8 @@ func RunOperator(ctx context.Context, controllerConfig *controllercmd.Controller
 			operatorNamespace,
 			trustedCAConfigMap,
 			configMapInformer,
-		)).WithCSIDriverControllerService(
+		),
+		withFIPSDaemonSetHook()).WithCSIDriverControllerService(
 		"AWSEFSDriverControllerServiceController",
 		replaceNamespaceFunc(operatorNamespace),
 		"controller.yaml",
@@ -110,6 +115,7 @@ func RunOperator(ctx context.Context, controllerConfig *controllercmd.Controller
 		csidrivercontrollerservicecontroller.WithSecretHashAnnotationHook(operatorNamespace, secretName, secretInformer),
 		csidrivercontrollerservicecontroller.WithObservedProxyDeploymentHook(),
 		csidrivercontrollerservicecontroller.WithReplicasHook(nodeInformer.Lister()),
+		withFIPSDeploymentHook(),
 	).WithCredentialsRequestController(
 		"AWSEFSDriverCredentialsRequestController",
 		operatorNamespace,
@@ -181,4 +187,52 @@ func replaceNamespaceFunc(namespace string) resourceapply.AssetFunc {
 		}
 		return bytes.Replace(content, []byte(namespaceReplaceKey), []byte(namespace), -1), nil
 	}
+}
+
+func getFIPSEnabled() string {
+	content, err := os.ReadFile("/proc/sys/crypto/fips_enabled")
+	if err == nil && string(content) == "1\n" {
+		return "true"
+	}
+	return "false"
+}
+
+func withFIPSDeploymentHookInternal(fipsEnbaled string) dc.DeploymentHookFunc {
+	return func(_ *opv1.OperatorSpec, deployment *appsv1.Deployment) error {
+		for i := range deployment.Spec.Template.Spec.Containers {
+			container := &deployment.Spec.Template.Spec.Containers[i]
+			if container.Name != "csi-driver" {
+				continue
+			}
+			container.Env = append(container.Env, corev1.EnvVar{
+				Name:  "FIPS_ENABLED",
+				Value: fipsEnbaled,
+			})
+		}
+		return nil
+	}
+}
+
+func withFIPSDeploymentHook() dc.DeploymentHookFunc {
+	return withFIPSDeploymentHookInternal(getFIPSEnabled())
+}
+
+func withFIPSDaemonSetHookInternal(fipsEnbaled string) csidrivernodeservicecontroller.DaemonSetHookFunc {
+	return func(_ *opv1.OperatorSpec, daemonSet *appsv1.DaemonSet) error {
+		for i := range daemonSet.Spec.Template.Spec.Containers {
+			container := &daemonSet.Spec.Template.Spec.Containers[i]
+			if container.Name != "csi-driver" {
+				continue
+			}
+			container.Env = append(container.Env, corev1.EnvVar{
+				Name:  "FIPS_ENABLED",
+				Value: fipsEnbaled,
+			})
+		}
+		return nil
+	}
+}
+
+func withFIPSDaemonSetHook() csidrivernodeservicecontroller.DaemonSetHookFunc {
+	return withFIPSDaemonSetHookInternal(getFIPSEnabled())
 }
